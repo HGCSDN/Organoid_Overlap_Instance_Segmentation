@@ -1,0 +1,4 @@
+# ninja log v7
+0	5165	1789625911130811357	/data/huanggui/project/Organoid_Overlap_Instance_Segmentation/Point-Teaching-main/build/temp.linux-x86_64-3.9/data/huanggui/project/Organoid_Overlap_Instance_Segmentation/Point-Teaching-main/pteacher/layers/ms_deform_attn/src/cpu/ms_deform_attn_cpu.o	e8020619393f32c3
+5170	20598	1789625916300726130	/data/huanggui/project/Organoid_Overlap_Instance_Segmentation/Point-Teaching-main/build/temp.linux-x86_64-3.9/data/huanggui/project/Organoid_Overlap_Instance_Segmentation/Point-Teaching-main/pteacher/layers/ms_deform_attn/src/vision.o	1dc3901b20e7d208
+9	18563	1789625980850659904	/data/huanggui/project/Organoid_Overlap_Instance_Segmentation/Point-Teaching-main/build/temp.linux-x86_64-3.9/data/huanggui/project/Organoid_Overlap_Instance_Segmentation/Point-Teaching-main/pteacher/layers/ms_deform_attn/src/cuda/ms_deform_attn_cuda.o	fd44012eb9c5d6e6

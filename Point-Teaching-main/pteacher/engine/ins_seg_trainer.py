@@ -1,5 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import os
+import sys
+from pathlib import Path
 import time
 import logging
 import torch
@@ -65,62 +67,13 @@ import torchvision
 import torchvision.transforms as transforms
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
-
-class PLU_Overlap_Judge(nn.Module):
-    """
-    Overlap_judge_head (Section 3.3):
-    Identifies incorrect segmentations caused by overlapping instances.
-    Input: ROI feature map (from Mask R-CNN's mask head).
-    Output: Probability p_i that the pseudo-label is correct (1) or erroneous/overlapping (0).
-    """
-    def __init__(self, in_channels=256, roi_size=14):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, 128, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(64, 1)
-        
-    def forward(self, roi_features):
-        # roi_features: (N, C, H, W)
-        x = F.relu(self.conv1(roi_features))
-        x = F.relu(self.conv2(x))
-        x = self.pool(x).flatten(1)
-        logits = self.fc(x).squeeze(1)
-        return logits # Returns raw logits, apply sigmoid later for probability p_i
-
-class PLU_Decomposition_Branch(nn.Module):
-    """
-    Overlapping decomposition branch (Section 3.3):
-    Reconstructs accurate masks of overlapped organoids from the corresponding feature map.
-    Predicts K potential instance masks and their existence probabilities (for counting).
-    """
-    def __init__(self, in_channels=256, roi_size=14, max_instances_K=5):
-        super().__init__()
-        self.max_K = max_instances_K
-        # Mask prediction head for K instances
-        self.mask_conv = nn.Sequential(
-            nn.Conv2d(in_channels, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(256, 256, kernel_size=2, stride=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, self.max_K, kernel_size=1) # Predict K masks
-        )
-        # Counting head: predicts existence probability e_i for each of the K instances
-        self.count_pool = nn.AdaptiveAvgPool2d(1)
-        self.count_fc = nn.Linear(256, self.max_K)
-        
-    def forward(self, roi_features):
-        # roi_features: (N, C, H, W)
-        # Predict K masks
-        mask_logits = self.mask_conv(roi_features) # (N, K, H_out, W_out)
-        
-        # Predict K existence probabilities
-        pooled = self.count_pool(roi_features).flatten(1)
-        count_logits = self.count_fc(pooled) # (N, K)
-        
-        return mask_logits, count_logits
+# ``OrgAI`` lives at the repository root, while this trainer is imported from
+# ``Point-Teaching-main``. Add that root explicitly for the documented launch
+# command (``python Point-Teaching-main/tools/train_net.py``).
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from OrgAI import PLU_Overlap_Judge, PLU_Decomposition_Branch
 
 def compute_plu_losses(judge_logits, decomp_mask_logits, decomp_count_logits, 
                        gt_overlap_labels, gt_decomp_masks, gt_decomp_counts, 
@@ -438,8 +391,8 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
         opt.batchSize = 1  # test code only supports batchSize = 1
         opt.serial_batches = True  # no shuffle
         opt.no_flip = True  # no flip
-        gen_model = create_model(opt)
-        self.gen_model = gen_model
+        # The synthesis-assisted branch requires a trained pix2pixHD generator.
+        self.gen_model = create_model(opt)
 
         # =====================================================
         # PLU Modules (Section 3.3)
@@ -447,8 +400,9 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
         # These modules operate on the ROI features from Mask R-CNN.
         # =====================================================
         # Assuming ROI feature dimension is 256 and mask head input size is 14x14
-        self.plu_judge = PLU_Overlap_Judge(in_channels=256, roi_size=14).cuda()
-        self.plu_decomp = PLU_Decomposition_Branch(in_channels=256, roi_size=14, max_instances_K=5).cuda()
+        self.plu_device = next(self.model.parameters()).device
+        self.plu_judge = PLU_Overlap_Judge(in_channels=256, roi_size=14).to(self.plu_device)
+        self.plu_decomp = PLU_Decomposition_Branch(in_channels=256, roi_size=14, max_instances_K=5).to(self.plu_device)
         
         # Optimizer for PLU modules (added to the main optimizer or separate)
         self.plu_optimizer = torch.optim.Adam(
@@ -661,8 +615,12 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
         else:
             if self.iter == self.cfg.SEMISUPNET.BURN_UP_STEP:
                 # update copy the the whole model
-			        # EMA update for the teacher model
-        self._update_teacher_model(self.model, self.model_teacher, keep_rate=0.996)
+                # EMA update for the teacher model
+                self._update_teacher_model(keep_rate=0.00)
+            else:
+                self._update_teacher_model(
+                    keep_rate=self.cfg.SEMISUPNET.EMA_KEEP_RATE
+                )
 
         record_dict = {}
         
@@ -730,7 +688,11 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
         # ------------------------------------------------------------------------------
 
         # Get image dimensions
-        height, width = unlabel_data_q[0]["image"].shape[1], unlabel_data_q[0]["image"].shape[2]
+        # PLU is supervised from the labeled stream.
+        plu_source_data = label_data_q
+        if not plu_source_data:
+            raise RuntimeError("PLU requires at least one labeled image per iteration")
+        height, width = plu_source_data[0]["image"].shape[1], plu_source_data[0]["image"].shape[2]
         
         # Determine Instance Augmentation (IA) type from config (default: scale_only)
         ia_type = getattr(self.cfg.SEMISUPNET, "IA_TYPE", "scale_only")
@@ -739,13 +701,13 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
         # 4. PLU Module: Extract ROI Features, Judge Overlap & Decompose
         # =====================================================
         plu_boxes = []
-        for data_dict in unlabel_data_q:
+        for data_dict in plu_source_data:
             if "instances" in data_dict and len(data_dict["instances"]) > 0:
-                plu_boxes.append(data_dict["instances"].gt_boxes)
+                plu_boxes.append(data_dict["instances"].gt_boxes.to(self.plu_device))
             else:
-                plu_boxes.append(Boxes(torch.empty((0, 4), device="cuda")))
+                plu_boxes.append(Boxes(torch.empty((0, 4), device=self.plu_device)))
                 
-        images_q = [x["image"] for x in unlabel_data_q]
+        images_q = [x["image"].to(self.plu_device) for x in plu_source_data]
         images_q = ImageList.from_tensors(images_q, self.model.backbone.size_divisibility)
         features_q = self.model.backbone(images_q.tensor)
         features_list_q = [features_q[f] for f in self.model.roi_heads.in_features]
@@ -755,10 +717,59 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
         judge_logits = self.plu_judge(roi_features)
         decomp_mask_logits, decomp_count_logits = self.plu_decomp(roi_features)
         
+        # Build targets from real instance masks. An ROI is marked overlapping
+        # only when its mask shares pixels with another GT mask;
+        # the masks in that overlap group become decomposition targets after
+        # cropping to the ROI.  This avoids the old all-ones placeholder labels.
+        overlap_labels = []
+        decomp_counts = []
+        decomp_masks = []
+        for data_dict in plu_source_data:
+            instances = data_dict.get("instances")
+            if instances is None or len(instances) == 0:
+                continue
+            if not instances.has("gt_masks"):
+                for _ in range(len(instances)):
+                    overlap_labels.append(1.0)
+                    decomp_counts.append(1)
+                    decomp_masks.append(torch.zeros((1, 28, 28), device=self.plu_device))
+                continue
+            masks = instances.gt_masks.tensor.to(self.plu_device, dtype=torch.bool)
+            boxes = instances.gt_boxes.to(self.plu_device)
+            n = len(instances)
+            intersections = torch.logical_and(
+                masks[:, None], masks[None, :]
+            ).flatten(2).sum(-1)
+            areas = masks.flatten(1).sum(1).clamp_min(1)
+            overlap_fraction = intersections / areas[:, None]
+            for j in range(n):
+                group = torch.where(overlap_fraction[j] > 0.05)[0]
+                # A mask is decomposable only if it overlaps another instance.
+                is_overlap = group.numel() > 1
+                overlap_labels.append(0.0 if is_overlap else 1.0)
+                if not is_overlap:
+                    decomp_counts.append(1)
+                    decomp_masks.append(
+                        masks[j:j + 1].float()
+                    )
+                    continue
+                group = group[:5]
+                cropped = BitMasks(masks[group]).crop_and_resize(
+                    boxes[j:j + 1].tensor.expand(group.numel(), -1), 28
+                )
+                decomp_counts.append(int(group.numel()))
+                decomp_masks.append(cropped.float())
+
         num_rois = roi_features.shape[0]
-        gt_overlap_labels = np.ones(num_rois) 
-        gt_decomp_counts = [1] * num_rois
-        gt_decomp_masks = [torch.ones((1, 28, 28), device="cuda")] * num_rois 
+        # Keep target cardinality synchronized with ROI pooling, including
+        # empty images or any proposal without a mask.
+        if len(overlap_labels) != num_rois:
+            overlap_labels = [1.0] * num_rois
+            decomp_counts = [1] * num_rois
+            decomp_masks = [torch.zeros((1, 28, 28), device=self.plu_device)] * num_rois
+        gt_overlap_labels = np.asarray(overlap_labels, dtype=np.float32)
+        gt_decomp_counts = decomp_counts
+        gt_decomp_masks = decomp_masks
         
         plu_loss_dict = compute_plu_losses(
             judge_logits, decomp_mask_logits, decomp_count_logits,
@@ -770,8 +781,38 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
         # =====================================================
         # 5. Contour Synthesis & Configurable IA
         # =====================================================
-        unlabel_data_s = [] 
-        overlap_probs = torch.sigmoid(judge_logits).cpu().numpy() if num_rois > 0 else np.array([])
+        unlabel_data_s = []
+        # Run PLU independently on teacher proposals. The labeled-stream
+        # outputs above are only for PLU supervision and must not be reused for
+        # unrelated unlabeled ROIs.
+        unlabel_boxes = []
+        for data_dict in unlabel_data_q:
+            instances = data_dict.get("instances")
+            if instances is not None and len(instances) > 0:
+                unlabel_boxes.append(instances.gt_boxes.to(self.plu_device))
+            else:
+                unlabel_boxes.append(Boxes(torch.empty((0, 4), device=self.plu_device)))
+        unlabel_images = ImageList.from_tensors(
+            [x["image"].to(self.plu_device) for x in unlabel_data_q],
+            self.model.backbone.size_divisibility,
+        )
+        with torch.no_grad():
+            unlabel_features = self.model.backbone(unlabel_images.tensor)
+            unlabel_feature_list = [
+                unlabel_features[f] for f in self.model.roi_heads.in_features
+            ]
+            unlabel_roi_features = self.model.roi_heads.mask_pooler(
+                unlabel_feature_list, unlabel_boxes
+            )
+            unlabel_judge_logits = self.plu_judge(unlabel_roi_features)
+            unlabel_decomp_mask_logits, unlabel_decomp_count_logits = self.plu_decomp(
+                unlabel_roi_features
+            )
+        unlabel_num_rois = unlabel_roi_features.shape[0]
+        overlap_probs = (
+            torch.sigmoid(unlabel_judge_logits).cpu().numpy()
+            if unlabel_num_rois > 0 else np.array([])
+        )
         
         idx = 0
         for i, data_dict in enumerate(unlabel_data_q):
@@ -800,9 +841,9 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
                 
                 # If PLU judges as overlapping, use decomposed masks
                 if current_prob < 0.5:
-                    pred_counts = torch.sigmoid(decomp_count_logits[idx-1])
+                    pred_counts = torch.sigmoid(unlabel_decomp_count_logits[idx-1])
                     k = max(1, (pred_counts > 0.5).sum().item())
-                    pred_masks = torch.sigmoid(decomp_mask_logits[idx-1])[:k]
+                    pred_masks = torch.sigmoid(unlabel_decomp_mask_logits[idx-1])[:k]
                     
                     for d_mask in pred_masks:
                         d_mask_np = d_mask.cpu().numpy()
@@ -867,13 +908,12 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
                         
             # Build Synthetic Data (SD)
             if len(new_gen_boxes) > 0:
-                # syn_image = self.gen_model(sum_mask) 
-                syn_image = torch.zeros((3, height, width), device="cuda") # Dummy placeholder
+                syn_image = self.gen_model(sum_mask)
                 
                 new_inst = Instances((height, width))
-                new_inst.gt_boxes = Boxes(torch.tensor(new_gen_boxes, device="cuda", dtype=torch.float32))
-                new_inst.gt_classes = torch.tensor(new_gen_classes, device="cuda", dtype=torch.long)
-                new_inst.gt_masks = torch.tensor(np.array(new_gen_masks), device="cuda", dtype=torch.bool)
+                new_inst.gt_boxes = Boxes(torch.tensor(new_gen_boxes, device=self.plu_device, dtype=torch.float32))
+                new_inst.gt_classes = torch.tensor(new_gen_classes, device=self.plu_device, dtype=torch.long)
+                new_inst.gt_masks = torch.tensor(np.array(new_gen_masks), device=self.plu_device, dtype=torch.bool)
                 
                 unlabel_data_s.append({
                     "image": syn_image,
@@ -923,13 +963,15 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
 
         losses = sum(loss_dict.values())
 
-	metrics_dict = record_dict
+        metrics_dict = record_dict
         metrics_dict["data_time"] = data_time
         self._write_metrics(metrics_dict)
 
         self.optimizer.zero_grad()
+        self.plu_optimizer.zero_grad()
         losses.backward()
         self.optimizer.step()
+        self.plu_optimizer.step()
 
     def _write_metrics(self, metrics_dict: dict):
         metrics_dict = {

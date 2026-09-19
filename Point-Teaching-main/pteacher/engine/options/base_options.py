@@ -71,7 +71,9 @@ class BaseOptions():
         if not self.initialized:
             self.initialize()
         # self.opt = self.parser.parse_args()
-        self.opt = self.parser.parse_args()
+        # This module is imported by the Point-Teaching trainer, whose command
+        # line has its own arguments. Ignore unrelated trainer arguments here.
+        self.opt, _ = self.parser.parse_known_args()
         self.opt.isTrain = self.isTrain   # train or test
 
         str_ids = self.opt.gpu_ids.split(',')

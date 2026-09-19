@@ -1,5 +1,19 @@
 # Organoid_Overlap_Instance_Segmentation
 Overlapping Organoid Instance Segmentation Using Pseudo-Label Unmixing and Synthesis-Assisted Learning
+
+## OrgAI modules
+
+The two organoid-specific pseudo-label unmixing heads are maintained as
+standalone modules under
+[`OrgAI`](OrgAI):
+
+- `overlap_judge.py` — `PLU_Overlap_Judge`, which predicts the reliability of each ROI pseudo-label.
+- `decomposition_mask.py` — `PLU_Decomposition_Branch`, which predicts candidate masks and instance-existence logits for overlapping organoids.
+
+`ins_seg_trainer.py` imports both classes from `OrgAI`; the
+module implementations are no longer duplicated in the trainer. See the
+[OrgAI README](OrgAI/README.md) for the
+interfaces and tensor shapes.
 # **Preprint/Associated Paper:**
 This code repository accompanies our preprint:  
  **"Boosting Overlapping Organoid Instance Segmentation Using Pseudo-Label Unmixing and Synthesis-Assisted Learning"**   
