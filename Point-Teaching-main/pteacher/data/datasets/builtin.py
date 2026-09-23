@@ -103,6 +103,26 @@ def register_coco_unlabel(root):
             )
 
 
+def register_lg_organoids(root):
+    """Register the repository's COCO-format LG_Organoids dataset."""
+    splits = {
+        "coco_organoids_train": "train",
+        "coco_organoids_val": "val",
+        "coco_organoids_test": "test",
+    }
+    for name, split in splits.items():
+        json_file = os.path.join(root, "LG_Organoids", split, "annotations", f"instances_{split}.json")
+        image_root = os.path.join(root, "LG_Organoids", split, "images")
+        # This module can be imported more than once by the project entrypoints.
+        # Detectron2 rejects duplicate registration, so make registration idempotent.
+        if name in DatasetCatalog:
+            continue
+        DatasetCatalog.register(
+            name, lambda json_file=json_file, image_root=image_root, name=name: load_coco_json(json_file, image_root, name)
+        )
+        MetadataCatalog.get(name).set(json_file=json_file, image_root=image_root, evaluator_type="coco")
+
+
 def register_coco_unlabel_instances(name, metadata, json_file, image_root):
     """
     Register a dataset in COCO's json annotation format for
@@ -187,3 +207,4 @@ _root = os.getenv("DETECTRON2_DATASETS", "datasets")
 register_coco_unlabel(_root)
 register_all_coco_train_points(_root)
 register_all_pascal_voc_w_points(_root)
+register_lg_organoids(_root)

@@ -1,0 +1,41 @@
+_BASE_: "../../Point-Teaching-main/configs/Mask-RCNN/Base-RCNN-FPN.yaml"
+
+# Mask R-CNN + the project's PLU heads.  The PLU heads are constructed by
+# MaskRCNNpteacherTrainer from OrgAI/overlap_judge.py and
+# OrgAI/decomposition_mask.py and operate on 14x14 ROI mask features.
+MODEL:
+  META_ARCHITECTURE: "TwoStagePseudoLabGeneralizedRCNN"
+  WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl"
+  MASK_ON: True
+  RESNETS:
+    DEPTH: 50
+  PROPOSAL_GENERATOR:
+    NAME: "PseudoLabRPN"
+  ROI_HEADS:
+    NAME: "StandardROIHeadsPseudoLab"
+    NUM_CLASSES: 1
+    IN_FEATURES: ["p2", "p3", "p4", "p5"]
+DATASETS:
+  TRAIN: ("coco_organoids_train",)
+  TEST: ("coco_organoids_val",)
+SOLVER:
+  IMS_PER_BATCH_LABEL: 2
+  IMS_PER_BATCH_UNLABEL: 2
+  BASE_LR: 0.001
+  MAX_ITER: 10000
+  STEPS: (7000, 9000)
+  CHECKPOINT_PERIOD: 1000
+DATALOADER:
+  SUP_PERCENT: 100.0
+  RANDOM_DATA_SEED: 0
+SEMISUPNET:
+  Trainer: "mask_rcnn_pteacher"
+  BBOX_THRESHOLD: 0.7
+  TEACHER_UPDATE_ITER: 1
+  BURN_UP_STEP: 2000
+  EMA_KEEP_RATE: 0.9996
+  UNSUP_LOSS_WEIGHT: 0.0
+TEST:
+  EVAL_PERIOD: 1000
+  EVALUATOR: "COCOeval"
+  VAL_LOSS: False

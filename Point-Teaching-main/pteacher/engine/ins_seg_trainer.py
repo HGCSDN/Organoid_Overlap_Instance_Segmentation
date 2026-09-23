@@ -344,6 +344,13 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
         with matching heuristics.
         """
         cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
+        # Per-class statistics are updated during the first semi-supervised
+        # step. Initialize them here so fully supervised/empty-pseudo-label
+        # smoke runs can enter the training loop safely.
+        self.num_gts_per_cls = defaultdict(int)
+        self.num_pseudos_per_cls = defaultdict(int)
+        self.pseudo_recall = defaultdict(float)
+        self.sampling_freq = defaultdict(float)
         data_loader = self.build_train_loader(cfg)
 
         # create an student model
@@ -391,8 +398,10 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
         opt.batchSize = 1  # test code only supports batchSize = 1
         opt.serial_batches = True  # no shuffle
         opt.no_flip = True  # no flip
-        # The synthesis-assisted branch requires a trained pix2pixHD generator.
-        self.gen_model = create_model(opt)
+        # Fully supervised PLU training does not need the synthesis branch.
+        self.gen_model = None
+        if cfg.SEMISUPNET.UNSUP_LOSS_WEIGHT > 0:
+            self.gen_model = create_model(opt)
 
         # =====================================================
         # PLU Modules (Section 3.3)
@@ -409,6 +418,10 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
             list(self.plu_judge.parameters()) + list(self.plu_decomp.parameters()), 
             lr=1e-4
         )
+        # PLU modules are created after the teacher/student models and must be
+        # registered as checkpointables only after they exist.
+        self.checkpointer.checkpointables["plu_judge"] = self.plu_judge
+        self.checkpointer.checkpointables["plu_decomp"] = self.plu_decomp
 
     def resume_or_load(self, resume=True):
         """
@@ -681,10 +694,9 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
             pseudo_recall_sum += self.pseudo_recall[key]
 
         sorted_pseudo_recall = sorted(self.pseudo_recall.items(), key=lambda kv: kv[1], reverse=True)
-        for ind, sorted_pseudo_recall_i in enumerate(sorted_pseudo_recall):
-            k = sorted_pseudo_recall[79 - ind][0]
-            v = sorted_pseudo_recall_i[1] / pseudo_recall_sum
-            self.sampling_freq[k] = v
+        if pseudo_recall_sum > 0:
+            for k, value in sorted_pseudo_recall:
+                self.sampling_freq[k] = value / pseudo_recall_sum
         # ------------------------------------------------------------------------------
 
         # Get image dimensions
@@ -707,8 +719,9 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
             else:
                 plu_boxes.append(Boxes(torch.empty((0, 4), device=self.plu_device)))
                 
-        images_q = [x["image"].to(self.plu_device) for x in plu_source_data]
-        images_q = ImageList.from_tensors(images_q, self.model.backbone.size_divisibility)
+        # Reuse Detectron2 preprocessing so uint8 dataset tensors are converted
+        # to the normalized floating-point representation expected by ResNet.
+        images_q = self.model.preprocess_image(plu_source_data)
         features_q = self.model.backbone(images_q.tensor)
         features_list_q = [features_q[f] for f in self.model.roi_heads.in_features]
         
@@ -734,7 +747,15 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
                     decomp_counts.append(1)
                     decomp_masks.append(torch.zeros((1, 28, 28), device=self.plu_device))
                 continue
-            masks = instances.gt_masks.tensor.to(self.plu_device, dtype=torch.bool)
+            if hasattr(instances.gt_masks, "tensor"):
+                masks = instances.gt_masks.tensor.to(self.plu_device, dtype=torch.bool)
+            else:
+                # COCO polygon annotations are represented as PolygonMasks by
+                # the mapper; rasterize them before constructing PLU targets.
+                masks = torch.stack([
+                    torch.from_numpy(polygons_to_bitmask(polygons, height, width))
+                    for polygons in instances.gt_masks.polygons
+                ]).to(self.plu_device, dtype=torch.bool)
             boxes = instances.gt_boxes.to(self.plu_device)
             n = len(instances)
             intersections = torch.logical_and(
@@ -792,10 +813,7 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
                 unlabel_boxes.append(instances.gt_boxes.to(self.plu_device))
             else:
                 unlabel_boxes.append(Boxes(torch.empty((0, 4), device=self.plu_device)))
-        unlabel_images = ImageList.from_tensors(
-            [x["image"].to(self.plu_device) for x in unlabel_data_q],
-            self.model.backbone.size_divisibility,
-        )
+        unlabel_images = self.model.preprocess_image(unlabel_data_q)
         with torch.no_grad():
             unlabel_features = self.model.backbone(unlabel_images.tensor)
             unlabel_feature_list = [
@@ -820,7 +838,19 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
                 continue
                 
             instances = data_dict["instances"]
-            masks = instances.gt_masks.tensor.cpu().numpy() if instances.has("gt_masks") else None
+            if instances.has("gt_masks"):
+                gt_masks = instances.gt_masks
+                if hasattr(gt_masks, "tensor"):
+                    masks = gt_masks.tensor.cpu().numpy()
+                elif torch.is_tensor(gt_masks):
+                    masks = gt_masks.detach().cpu().numpy()
+                else:
+                    masks = np.stack([
+                        polygons_to_bitmask(polygons, height, width)
+                        for polygons in gt_masks.polygons
+                    ])
+            else:
+                masks = None
             boxes = instances.gt_boxes.tensor.cpu().numpy()
             classes = instances.gt_classes.cpu().numpy()
             
@@ -829,6 +859,9 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
             
             for j in range(len(instances)):
                 mask = masks[j] if masks is not None else np.zeros((height, width), dtype=np.uint8)
+                mask = np.squeeze(mask)
+                if mask.ndim != 2:
+                    mask = mask[0] if mask.shape[0] <= 4 else mask[..., 0]
                 im_obj_cls = classes[j] + 1 
                 
                 current_prob = overlap_probs[idx] if idx < len(overlap_probs) else 1.0
@@ -907,7 +940,7 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
                         new_gen_classes.append(classes[j])
                         
             # Build Synthetic Data (SD)
-            if len(new_gen_boxes) > 0:
+            if len(new_gen_boxes) > 0 and self.gen_model is not None:
                 syn_image = self.gen_model(sum_mask)
                 
                 new_inst = Instances((height, width))
@@ -929,7 +962,10 @@ class MaskRCNNpteacherTrainer(DefaultTrainer):
         record_dict.update(record_all_label_data)
 
         # 2. L_pseudo: Unlabeled data + Pseudo-labels (PD)
-        record_pseudo_data, _, _, _ = self.model(unlabel_data_q, branch="supervised")
+        if self.cfg.SEMISUPNET.UNSUP_LOSS_WEIGHT > 0:
+            record_pseudo_data, _, _, _ = self.model(unlabel_data_q, branch="supervised")
+        else:
+            record_pseudo_data = {}
         for key in record_pseudo_data.keys():
             record_dict[key + "_pseudo"] = record_pseudo_data[key]
 
@@ -2195,10 +2231,9 @@ class MaskRCNNPointSupTrainer(MaskRCNNpteacherTrainer):
             pseudo_recall_sum += self.pseudo_recall[key]
 
         sorted_pseudo_recall = sorted(self.pseudo_recall.items(), key=lambda kv: kv[1], reverse=True)
-        for ind, sorted_pseudo_recall_i in enumerate(sorted_pseudo_recall):
-            k = sorted_pseudo_recall[79 - ind][0]
-            v = sorted_pseudo_recall_i[1] / pseudo_recall_sum
-            self.sampling_freq[k] = v
+        if pseudo_recall_sum > 0:
+            for k, value in sorted_pseudo_recall:
+                self.sampling_freq[k] = value / pseudo_recall_sum
 
         # print("self.num_gts_per_cls", self.num_gts_per_cls)
         # print("self.num_pseudos_per_cls", self.num_pseudos_per_cls)

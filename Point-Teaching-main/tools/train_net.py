@@ -78,9 +78,10 @@ def main(args):
             DetectionCheckpointer(
                 ensem_ts_model, save_dir=cfg.OUTPUT_DIR
             ).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume)
-            res = Trainer.gen_pseudo_labels_offline(cfg, ensem_ts_model.modelTeacher)
-            # res = Trainer.test(cfg, ensem_ts_model.modelTeacher)
-            # res = Trainer.test(cfg, ensem_ts_model.modelStudent)
+            # The pteacher trainers in this checkout do not implement an
+            # offline pseudo-label API. Evaluate the loaded teacher model
+            # through Detectron2's registered evaluator instead.
+            res = Trainer.test(cfg, ensem_ts_model.modelTeacher)
         else:
             model = Trainer.build_model(cfg)
             DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(

@@ -192,6 +192,10 @@ def build_detection_semisup_train_loader_two_crops(cfg, mapper=None):
             cfg.DATALOADER.RANDOM_DATA_SEED,
             cfg.DATALOADER.RANDOM_DATA_SEED_PATH,
         )
+        if cfg.DATALOADER.SUP_PERCENT >= 100.0:
+            # Keep the two-crop loader valid in full-label mode. PLU targets
+            # are still built only from the labeled stream by the trainer.
+            unlabel_dicts = list(label_dicts)
 
     label_dataset = DatasetFromList(label_dicts, copy=False)
     # exclude the labeled set from unlabeled dataset
